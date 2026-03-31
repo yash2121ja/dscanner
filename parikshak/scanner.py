@@ -111,58 +111,124 @@ def _extract_image(image: str, auth: dict | None) -> str:
     try:
         cid = subprocess.run(
             ["docker", "create", image, "true"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=300,
         )
         if cid.returncode == 0:
             container_id = cid.stdout.strip()
-            tar_path = os.path.join(tmp, "image.tar")
-            subprocess.run(
-                ["docker", "export", container_id, "-o", tar_path],
-                capture_output=True, timeout=120,
-            )
+
+            # Method 1: docker cp key files directly (fast, reliable)
+            key_files = [
+                ("var/lib/dpkg/status", "var/lib/dpkg/status"),
+                ("lib/apk/db/installed", "lib/apk/db/installed"),
+                ("etc/os-release", "etc/os-release"),
+                ("etc/debian_version", "etc/debian_version"),
+                ("etc/alpine-release", "etc/alpine-release"),
+                ("etc/shadow", "etc/shadow"),
+            ]
+            extracted_any = False
+            for src, dst in key_files:
+                dst_path = os.path.join(tmp, dst)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                cp = subprocess.run(
+                    ["docker", "cp", f"{container_id}:/{src}", dst_path],
+                    capture_output=True, timeout=30,
+                )
+                if cp.returncode == 0:
+                    extracted_any = True
+
+            # Also grab pip metadata directories
+            for pydir in ["usr/local/lib", "usr/lib"]:
+                dst_dir = os.path.join(tmp, pydir)
+                os.makedirs(dst_dir, exist_ok=True)
+                subprocess.run(
+                    ["docker", "cp", f"{container_id}:/{pydir}/.", dst_dir],
+                    capture_output=True, timeout=60,
+                )
+
+            # Method 2: full export as fallback if docker cp got nothing
+            if not extracted_any:
+                tar_path = os.path.join(tmp, "image.tar")
+                subprocess.run(
+                    ["docker", "export", container_id, "-o", tar_path],
+                    capture_output=True, timeout=600,
+                )
+                if os.path.exists(tar_path):
+                    with tarfile.open(tar_path, "r") as tar:
+                        for member in tar.getmembers():
+                            if member.issym() or member.islnk():
+                                continue
+                            if ".." in member.name or member.name.startswith("/"):
+                                continue
+                            try:
+                                tar.extract(member, tmp, filter="fully_trusted")
+                            except (OSError, PermissionError, tarfile.TarError):
+                                pass
+                    os.unlink(tar_path)
+
             subprocess.run(["docker", "rm", container_id], capture_output=True)
-            if os.path.exists(tar_path):
-                with tarfile.open(tar_path, "r") as tar:
-                    for member in tar.getmembers():
-                        if member.issym() or member.islnk():
-                            continue  # skip symlinks (cause issues on Windows)
-                        if ".." in member.name or member.name.startswith("/"):
-                            continue
-                        try:
-                            tar.extract(member, tmp, filter="fully_trusted")
-                        except (OSError, PermissionError):
-                            pass
-                os.unlink(tar_path)
-                return tmp
+            return tmp
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # Fallback: minimal extraction for package DBs only
-    # (full registry extraction is in the engine module)
     return tmp
 
 
 # ── Distro detection ────────────────────────────────────────────────────
 
 def _detect_distro(root: str) -> dict:
-    """Read /etc/os-release."""
+    """Read /etc/os-release, fallback to /etc/debian_version etc."""
     info = {"id": "", "version_id": "", "codename": "", "family": "unknown"}
-    os_release = os.path.join(root, "etc/os-release")
-    if not os.path.isfile(os_release):
-        return info
 
-    with open(os_release, errors="replace") as f:
-        for line in f:
-            if "=" not in line:
-                continue
-            key, _, val = line.strip().partition("=")
-            val = val.strip('"').strip("'")
-            if key == "ID":
-                info["id"] = val.lower()
-            elif key == "VERSION_ID":
-                info["version_id"] = val
-            elif key == "VERSION_CODENAME":
-                info["codename"] = val.lower()
+    os_release = os.path.join(root, "etc/os-release")
+    if os.path.isfile(os_release):
+        with open(os_release, errors="replace") as f:
+            for line in f:
+                if "=" not in line:
+                    continue
+                key, _, val = line.strip().partition("=")
+                val = val.strip('"').strip("'")
+                if key == "ID":
+                    info["id"] = val.lower()
+                elif key == "VERSION_ID":
+                    info["version_id"] = val
+                elif key == "VERSION_CODENAME":
+                    info["codename"] = val.lower()
+
+    # Fallback: /etc/debian_version
+    if not info["id"]:
+        deb_ver = os.path.join(root, "etc/debian_version")
+        if os.path.isfile(deb_ver):
+            info["id"] = "debian"
+            try:
+                with open(deb_ver) as f:
+                    ver = f.read().strip()
+                info["version_id"] = ver
+                # Map version numbers to codenames
+                codename_map = {
+                    "14": "forky", "13": "trixie", "12": "bookworm",
+                    "11": "bullseye", "10": "buster", "9": "stretch",
+                    "8": "jessie", "7": "wheezy",
+                }
+                major = ver.split(".")[0]
+                info["codename"] = codename_map.get(major, "sid")
+            except OSError:
+                info["codename"] = "sid"
+
+    # Fallback: /etc/alpine-release
+    if not info["id"]:
+        alp_rel = os.path.join(root, "etc/alpine-release")
+        if os.path.isfile(alp_rel):
+            info["id"] = "alpine"
+            try:
+                with open(alp_rel) as f:
+                    info["version_id"] = f.read().strip()
+            except OSError:
+                pass
+
+    # Fallback: dpkg exists = debian family
+    if not info["id"] and os.path.isfile(os.path.join(root, "var/lib/dpkg/status")):
+        info["id"] = "debian"
+        info["codename"] = "sid"  # use sid as broadest fallback
 
     # Determine family
     if info["id"] in ("debian", "ubuntu", "raspbian"):
@@ -355,12 +421,16 @@ def _match_offline(packages, distro) -> list[dict]:
     if not db:
         return []
 
-    # Build ecosystem key from distro
-    eco_key = ""
+    # Build ecosystem keys to try (exact codename first, then sid as fallback)
+    eco_keys = []
     if distro.get("family") == "debian" and distro.get("codename"):
-        eco_key = f"debian-{distro['codename']}"
+        eco_keys.append(f"debian-{distro['codename']}")
+        if distro["codename"] != "sid":
+            eco_keys.append("debian-sid")  # sid has broadest coverage
+    elif distro.get("family") == "debian":
+        eco_keys.append("debian-sid")
     elif distro.get("family") == "alpine" and distro.get("version_id"):
-        eco_key = f"alpine-{'.'.join(distro['version_id'].split('.')[:2])}"
+        eco_keys.append(f"alpine-{'.'.join(distro['version_id'].split('.')[:2])}")
 
     # Build lookup index: (package_name, ecosystem) → [advisories]
     index = {}
@@ -376,9 +446,15 @@ def _match_offline(packages, distro) -> list[dict]:
 
     vulns = []
     for name, version, pkg_type, eco in packages:
-        # Map package ecosystem to DB ecosystem
-        lookup_eco = eco_key if eco in ("debian", "alpine") and eco_key else eco
-        advisories = index.get((name, lookup_eco), [])
+        # Map package ecosystem to DB ecosystem — try exact match, then fallbacks
+        advisories = []
+        if eco in ("debian", "alpine") and eco_keys:
+            for ek in eco_keys:
+                advisories = index.get((name, ek), [])
+                if advisories:
+                    break
+        else:
+            advisories = index.get((name, eco), [])
 
         for adv in advisories:
             fixed = adv.get("fix")
