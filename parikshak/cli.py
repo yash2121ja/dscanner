@@ -42,7 +42,7 @@ def main():
 @click.option("--misconfig/--no-misconfig", default=True, help="Check misconfigurations")
 @click.option("--all", "scan_all", is_flag=True, help="Enable all checks")
 @click.option("--offline", is_flag=True, help="Use local DB only, no API calls")
-@click.option("--api-url", default="https://api.dscanner.io", envvar="DSCANNER_API_URL", help="VulnIntel DB API URL")
+@click.option("--api-url", default="http://localhost:9000", envvar="PARIKSHAK_API_URL", help="VulnIntel DB API URL")
 @click.option("--username", "-u", default="", help="Registry username")
 @click.option("--password", "-p", default="", help="Registry password")
 @click.option("--quiet", "-q", is_flag=True, help="Only output results, no progress")

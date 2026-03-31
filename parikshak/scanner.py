@@ -330,10 +330,88 @@ def _match_vulnerabilities(packages, distro, api_url, offline) -> list[dict]:
 
 
 def _match_offline(packages, distro) -> list[dict]:
-    """Offline fallback — uses local DB file if available."""
-    # For now, return empty. Local DB support can be added later.
-    _log.info("Offline mode: no local DB available")
-    return []
+    """Offline fallback — downloads DB from GitHub if needed, then matches locally."""
+    from parikshak.db import load_db, DB_FILE, GITHUB_DB_URL
+    from rich.console import Console
+
+    console = Console()
+
+    # Auto-download DB from GitHub if not present
+    if not DB_FILE.exists():
+        console.print("  [yellow]Downloading advisory DB from GitHub...[/yellow]", end="")
+        try:
+            DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+            resp = httpx.get(GITHUB_DB_URL, timeout=120, follow_redirects=True)
+            resp.raise_for_status()
+            with open(DB_FILE, "wb") as f:
+                f.write(resp.content)
+            size_mb = DB_FILE.stat().st_size / 1024 / 1024
+            console.print(f" [green]done ({size_mb:.1f}MB)[/green]")
+        except Exception as exc:
+            console.print(f" [red]failed: {exc}[/red]")
+            return []
+
+    db = load_db()
+    if not db:
+        return []
+
+    # Build ecosystem key from distro
+    eco_key = ""
+    if distro.get("family") == "debian" and distro.get("codename"):
+        eco_key = f"debian-{distro['codename']}"
+    elif distro.get("family") == "alpine" and distro.get("version_id"):
+        eco_key = f"alpine-{'.'.join(distro['version_id'].split('.')[:2])}"
+
+    # Build lookup index: (package_name, ecosystem) → [advisories]
+    index = {}
+    for adv in db.get("advisories", []):
+        key = (adv.get("pkg", ""), adv.get("eco", ""))
+        index.setdefault(key, []).append(adv)
+
+    # KEV set for flagging
+    kev_set = set(db.get("kev_cves", []))
+
+    # EPSS scores
+    epss_data = db.get("epss", {})
+
+    vulns = []
+    for name, version, pkg_type, eco in packages:
+        # Map package ecosystem to DB ecosystem
+        lookup_eco = eco_key if eco in ("debian", "alpine") and eco_key else eco
+        advisories = index.get((name, lookup_eco), [])
+
+        for adv in advisories:
+            fixed = adv.get("fix")
+            # If fixed version exists and installed >= fixed, skip
+            if fixed and version and _version_gte(version, fixed, distro.get("family", "")):
+                continue
+
+            cve_id = adv.get("cve", "")
+            epss = epss_data.get(cve_id, {})
+
+            vulns.append({
+                "cve_id": cve_id,
+                "severity": adv.get("sev") or "MEDIUM",
+                "package_name": name,
+                "installed_version": version,
+                "fixed_version": fixed,
+                "description": adv.get("desc", ""),
+                "cvss_v3_score": adv.get("cvss"),
+                "source": adv.get("src", ""),
+                "epss": epss.get("score"),
+                "is_kev": cve_id in kev_set,
+            })
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for v in vulns:
+        key = (v["cve_id"], v["package_name"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(v)
+
+    return unique
 
 
 def _version_gte(installed: str, fixed: str, family: str) -> bool:

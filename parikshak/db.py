@@ -18,13 +18,13 @@ import httpx
 
 _log = logging.getLogger(__name__)
 
-DB_DIR = Path.home() / ".dscanner" / "db"
+DB_DIR = Path.home() / ".parikshak" / "db"
 DB_FILE = DB_DIR / "vuln-db.json.gz"
 DB_META = DB_DIR / "meta.json"
 
-# Default: download from GitHub Releases
-GITHUB_DB_URL = "https://github.com/yourorg/vuln-intel-db/releases/download/db-latest/vuln-db.json.gz"
-GITHUB_META_URL = "https://github.com/yourorg/vuln-intel-db/releases/download/db-latest/db-meta.json"
+# Download from GitHub Releases (built by vuln-intel-db GitHub Actions every 6h)
+GITHUB_DB_URL = "https://github.com/yash2121ja/vuln-intel-db/releases/download/db-latest/vuln-db.json.gz"
+GITHUB_META_URL = "https://github.com/yash2121ja/vuln-intel-db/releases/download/db-latest/db-meta.json"
 
 
 def update_db(api_url: str | None = None) -> dict:
